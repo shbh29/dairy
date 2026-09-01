@@ -385,6 +385,78 @@ fn run_loop() {
     let mut draft_path = crate::draft::draft_path();
     let mut draft = load_or_create_draft(&draft_path);
 
+    // Spawn background reminder thread that reads the draft file periodically
+    // and sends a notification when 2 minutes remain and the user is inactive.
+    let reminder_path = draft_path.clone();
+    std::thread::spawn(move || {
+        use chrono::Local;
+        loop {
+            let draft = crate::draft::load_or_create_draft(&reminder_path);
+            if let Some(slot_start) = &draft.work_mode.current_slot_start {
+                if draft.work_mode.notification_sent_for_slot.as_ref() != Some(slot_start) {
+                    if let Some(slot_min) = slot_minute(slot_start) {
+                        let slot_end_min = slot_min + draft.work_mode.slot_minutes as u32;
+                        let now = Local::now();
+                        let current_min = now.hour() * 60 + now.minute();
+                        let minutes_remaining = slot_end_min as i32 - current_min as i32;
+
+                        if minutes_remaining <= 2 && minutes_remaining > 0 {
+                            // check inactivity and maximum inactivity window (3 slots)
+                            let max_inactive_seconds = (draft.work_mode.slot_minutes as i64) * 3 * 60;
+                            let inactivity_seconds = match &draft.work_mode.last_interaction_at {
+                                Some(ts) => match chrono::DateTime::parse_from_rfc3339(ts) {
+                                    Ok(t) => now.signed_duration_since(t).num_seconds(),
+                                    Err(_) => 0,
+                                },
+                                None => 0,
+                            };
+
+                            // if user has been inactive for more than 3 * slot_minutes, suppress further reminders for this slot
+                            if inactivity_seconds > max_inactive_seconds {
+                                let mut updated = crate::draft::load_or_create_draft(&reminder_path);
+                                updated.work_mode.notification_sent_for_slot = Some(slot_start.clone());
+                                crate::draft::save_draft(&reminder_path, &updated);
+                                // skip notifying
+                            } else if inactivity_seconds > 30 {
+                                let start_display = if let Some(rest) = slot_start.split('T').nth(1) {
+                                    let mut parts = rest.split(':');
+                                    let hour = parts.next().unwrap_or("00");
+                                    let minute = parts.next().unwrap_or("00");
+                                    format!("{}:{}", hour, minute)
+                                } else {
+                                    slot_start.clone()
+                                };
+                                let end_hour = ((slot_min + draft.work_mode.slot_minutes as u32) / 60) % 24;
+                                let end_minute = (slot_min + draft.work_mode.slot_minutes as u32) % 60;
+                                let end_display = format!("{:02}:{:02}", end_hour, end_minute);
+
+                                let body = format!(
+                                    "{} minutes left in current work slot ({} - {}). Consider closing or updating it.",
+                                    minutes_remaining, start_display, end_display
+                                );
+
+                                if let Err(e) = notify_rust::Notification::new()
+                                    .summary("Dairy Work Reminder")
+                                    .body(&body)
+                                    .show()
+                                {
+                                    eprintln!("Failed to show notification: {}", e);
+                                }
+
+                                // persist that we've notified for this slot
+                                let mut updated = crate::draft::load_or_create_draft(&reminder_path);
+                                updated.work_mode.notification_sent_for_slot = Some(slot_start.clone());
+                                crate::draft::save_draft(&reminder_path, &updated);
+                            }
+                        }
+                    }
+                }
+            }
+
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        }
+    });
+
     finalize_if_day_changed(&draft_path, &mut draft);
     println!("Daily Draft: {}", draft.title);
     list_template(&draft);
@@ -392,12 +464,14 @@ fn run_loop() {
 
     loop {
         finalize_if_day_changed(&draft_path, &mut draft);
-        check_and_send_notification(&mut draft.work_mode);
         print!("dairy> ");
         io::stdout().flush().expect("flush prompt");
 
         let mut input = String::new();
         io::stdin().read_line(&mut input).expect("read command");
+        // record last interaction so background reminders avoid notifying while user is active
+        draft.work_mode.last_interaction_at = Some(chrono::Local::now().to_rfc3339());
+        crate::draft::save_draft(&draft_path, &draft);
         let trimmed = input.trim();
 
         if trimmed.is_empty() {
@@ -628,6 +702,7 @@ mod tests {
                     },
                 ],
                 notification_sent_for_slot: None,
+                last_interaction_at: None,
             },
             content: String::new(),
             summary_rating: String::new(),
@@ -664,6 +739,7 @@ mod tests {
                     worked: false,
                 }],
                 notification_sent_for_slot: None,
+                last_interaction_at: None,
             },
             content: String::new(),
             summary_rating: String::new(),
@@ -693,6 +769,7 @@ mod tests {
                 slots_skipped: 0,
                 slots: vec![],
                 notification_sent_for_slot: None,
+                last_interaction_at: None,
             },
             content: "old day".to_string(),
             summary_rating: String::new(),

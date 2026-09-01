@@ -51,6 +51,7 @@ pub struct WorkMode {
     pub slots_skipped: u32,
     pub slots: Vec<WorkSlot>,
     pub notification_sent_for_slot: Option<String>,
+    pub last_interaction_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

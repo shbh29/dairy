@@ -38,6 +38,7 @@ fn default_work_mode() -> WorkMode {
             worked: false,
         }],
         notification_sent_for_slot: None,
+        last_interaction_at: None,
     }
 }
 
@@ -267,6 +268,18 @@ pub fn load_or_create_historical_draft(date: &str) -> Result<DailyDraft, String>
                 )
                 .map_err(|err| format!("decrypt historical entry: {err}"))?;
 
+                // Try to interpret decrypted content as a serialized DailyDraft.
+                if let Ok(parsed_draft) = serde_json::from_str::<DailyDraft>(&content) {
+                    let mut draft = parsed_draft;
+                    draft.date = date.to_string();
+                    draft.title = entry.title.clone();
+                    draft.template = entry.template.clone();
+                    draft.updated_at = entry.updated_at.clone();
+                    save_draft(&path, &draft);
+                    return Ok(draft);
+                }
+
+                // Fallback: treat decrypted content as the plain content body
                 let mut draft = fresh_draft();
                 draft.date = date.to_string();
                 draft.title = format!("{}-{}", date, parsed_date.format("%A"));
@@ -323,7 +336,9 @@ pub fn finalize_draft(draft_path: &Path) -> Result<PathBuf, String> {
 
     let keystore_key_path = crate::keystore::keystore_path();
     let key = crate::keystore::ensure_keystore_key(&keystore_key_path);
-    let (nonce_hex, ciphertext_hex, tag_hex) = encrypt_plaintext_for_archive(key, &draft.content);
+    // Encrypt the full draft JSON so work slots and reminder state are preserved in the archive
+    let plaintext = serde_json::to_string(&draft).map_err(|err| format!("serialize draft: {err}"))?;
+    let (nonce_hex, ciphertext_hex, tag_hex) = encrypt_plaintext_for_archive(key, &plaintext);
 
     archive.entries.push(JournalEntry {
         id: format!("{}-{}", draft.date, draft.title),
